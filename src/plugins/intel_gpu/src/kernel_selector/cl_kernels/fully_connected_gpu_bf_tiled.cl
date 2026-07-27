@@ -7,6 +7,15 @@
 #include "include/batch_headers/sub_group_block_write.cl"
 #include "include/batch_headers/sub_group_shuffle.cl"
 
+// 2-bit packed weights reuse the 4-bit compressed code paths;
+// only the number of values packed per byte differs (4 for u2, 2 for u4)
+#if COMPRESSED_WEIGHTS_INT2
+    #define COMPRESSED_WEIGHTS_INT4 1
+    #define FILTER_ELEMENTS_PER_BYTE 4
+#else
+    #define FILTER_ELEMENTS_PER_BYTE 2
+#endif
+
 // JIT Parameters:
 // SIMD         - sub-group size/simd width, one of {8, 16};
 // TILE_B       - number of batches processed by each work-item;
@@ -87,8 +96,8 @@ KERNEL(quantize_input)(
 #endif
 
 #if COMPRESSED_WEIGHTS_INT4
-#   if TILE_K_OFM != TILE_K_OFM_PACKED * 2
-#       error "fully_connected_gpu_bf_tiled.cl - TILE_K_OFM must be divisible by 2 for 4-bit compressed case"
+#   if TILE_K_OFM != TILE_K_OFM_PACKED * FILTER_ELEMENTS_PER_BYTE
+#       error "fully_connected_gpu_bf_tiled.cl - TILE_K_OFM must be divisible by the number of values packed per byte for compressed case"
 #   endif
 #   if FILTER_LAYOUT_OS_IS_YX_OSV32_ISV2 && TILE_K != 4 && TILE_K != 2 && TILE_K != 1
 #       error "fully_connected_gpu_bf_tiled.cl - TILE_K must be one of {1, 2, 4}"
@@ -278,7 +287,7 @@ inline void FUNC(fc_bf_tiled_kernel_default)(
     // ...
     uint weights_offset =  osv64_weight_base * osv_weight_stride + out_f_offset;
     #else
-    uint weights_offset = out_f * (INPUT_ELEMENTS_COUNT / 2);
+    uint weights_offset = out_f * (INPUT_ELEMENTS_COUNT / FILTER_ELEMENTS_PER_BYTE);
     #endif
 #else
     uint weights_offset = out_f * INPUT_ELEMENTS_COUNT;

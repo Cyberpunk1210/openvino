@@ -432,6 +432,18 @@ static void add_common_consts(const RuntimeParams& params, JitConstants& jit) {
         jit.make("MOE_WEI_DT", "uchar");
         jit.make("MOE_SCALE_DT", "half");
         jit.make("MOE_ZP_DT", "uchar");
+    } else if (weight_dt == ov::element::u2) {
+        // u2: 4 values per byte, LSB-first. Served by the batched GEMV kernels for all
+        // token counts (micro-gemm and oneDNN have no u2 support).
+        OPENVINO_ASSERT(desc->_config.hidden_size % 4 == 0 && desc->_config.inter_size % 4 == 0,
+                        "MoE u2 weights require hidden_size and inter_size to be multiples of 4, got hidden_size=",
+                        desc->_config.hidden_size,
+                        ", inter_size=",
+                        desc->_config.inter_size);
+        jit.make("WEIGHT_COMPRESSEION_DT", 3);
+        jit.make("MOE_WEI_DT", "uchar");
+        jit.make("MOE_SCALE_DT", "half");
+        jit.make("MOE_ZP_DT", "uchar");
     } else if (weight_dt == ov::element::u8 || weight_dt == ov::element::i8) {
         jit.make("WEIGHT_COMPRESSEION_DT", 1);
         jit.make("MOE_WEI_DT", "uchar");
@@ -949,6 +961,7 @@ public:
     bool use_micro_gemm_prefill = false;
     bool use_gpu_mask_gen_prefill = false;
     bool use_grouped_gemm_prefill = false;
+    bool _weights_u2 = false;  // u2 weights: batched GEMV serves all token counts
     size_t batched_gemv_threshold = 32;  // token_num <= threshold uses batched GEMV path
 
     moe_3gemm_swiglu_opt_impl() : PrimitiveImplOCL(moe_3gemm_swiglu_opt::get_type_info_static()) {}
@@ -979,9 +992,16 @@ public:
             use_micro_gemm_prefill = false;
         }
 
+        // u2 (2-bit) weights: micro-gemm and oneDNN have no u2 support; the hand-written
+        // batched GEMV kernels serve all token counts instead.
+        _weights_u2 = (weight_dt == data_types::u2);
+
         // grouped_gemm path: single OneDNN grouped matmul per GEMM layer (all experts at once).
         // micro_gemm takes priority; grouped_gemm falls back to onednn loop by default.
         use_grouped_gemm_prefill = config.get_moe_use_grouped_gemm_prefill();
+        if (_weights_u2) {
+            use_grouped_gemm_prefill = false;  // oneDNN grouped GEMM has no u2 weight support
+        }
         // grouped_gemm supersedes micro_gemm
         if (use_grouped_gemm_prefill) {
             use_micro_gemm_prefill = false;
@@ -997,6 +1017,8 @@ public:
 
         // Weight provider: select based on OTD configuration.
         auto cur_moe = node.as<moe_3gemm_fused_compressed>().get_primitive();
+        OPENVINO_ASSERT(!_weights_u2 || cur_moe->_otd.lru_expert_num == 0,
+                        "moe_3gemm: u2 weights are not supported with OTD (expert offload) yet");
         if (cur_moe->_otd.lru_expert_num > 0) {
             _weight_provider = std::make_shared<OffloadExpertWeightProvider>(cur_moe->_otd.lru_expert_num,
                                                                              cur_moe->_config,
@@ -1273,6 +1295,7 @@ public:
         ib >> use_gpu_mask_gen_prefill;
         ib >> use_grouped_gemm_prefill;
         const kernel_impl_params* impl_params = reinterpret_cast<kernel_impl_params*>(ib.getKernelImplParams());
+        _weights_u2 = impl_params->get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_0)).data_type == data_types::u2;
         init(impl_params->typed_desc<moe_3gemm_fused_compressed>());
     }
 
@@ -1287,6 +1310,7 @@ public:
         cur_moe->use_micro_gemm_prefill = use_micro_gemm_prefill;
         cur_moe->use_gpu_mask_gen_prefill = use_gpu_mask_gen_prefill;
         cur_moe->use_grouped_gemm_prefill = use_grouped_gemm_prefill;
+        cur_moe->_weights_u2 = _weights_u2;
         cur_moe->batched_gemv_threshold = batched_gemv_threshold;
         cur_moe->_activation_type = _activation_type;
         return cur_moe;
@@ -2563,7 +2587,8 @@ public:
 
         // Batched GEMV: for small token counts (including single token, MTP/speculative decoding),
         // use optimized GEMV kernels with batch dimension. Avoids gather/scatter overhead.
-        if (token_num <= batched_gemv_threshold) {
+        // u2 weights always take this path: micro-gemm and oneDNN have no u2 support.
+        if (_weights_u2 || token_num <= batched_gemv_threshold) {
             return exec_batched_gemv(events, instance, scratch, token_num);
         }
 

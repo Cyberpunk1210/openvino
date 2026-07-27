@@ -148,6 +148,7 @@ std::string toString(Datatype dType) {
     switch (dType) {
         case Datatype::UINT4:  return "UINT4";
         case Datatype::INT4:   return "INT4";
+        case Datatype::UINT2:  return "UINT2";
         case Datatype::INT8:   return "INT8";
         case Datatype::UINT8:  return "UINT8";
         case Datatype::INT16:  return "INT16";
@@ -170,6 +171,7 @@ std::string toString(WeightsType wType) {
         case WeightsType::F32:    return "F32";
         case WeightsType::UINT4:  return "UINT4";
         case WeightsType::INT4:   return "INT4";
+        case WeightsType::UINT2:  return "UINT2";
         case WeightsType::INT8:   return "INT8";
         case WeightsType::UINT8:  return "UINT8";
         case WeightsType::INT32:  return "INT32";

@@ -281,6 +281,7 @@ ParamsKey FullyConnected_bf_tiled::GetSupportedKey() const {
     k.EnableOutputDataType(Datatype::UINT8);
     k.EnableInputWeightsType(WeightsType::UINT4);
     k.EnableInputWeightsType(WeightsType::INT4);
+    k.EnableInputWeightsType(WeightsType::UINT2);
     k.EnableInputWeightsType(WeightsType::UINT8);
     k.EnableInputWeightsType(WeightsType::INT8);
     k.EnableInputWeightsType(WeightsType::F16);
@@ -351,6 +352,17 @@ bool FullyConnected_bf_tiled::Validate(const Params& params) const {
 
     auto wt = weights.GetDType();
     if ((wt == WeightsType::UINT4 || wt == WeightsType::INT4) && (weights.IFM().v % 2 != 0)) {
+        DO_NOT_USE_THIS_KERNEL(params.layerID);
+    }
+
+    // 2-bit packed weights are supported only with IFM aligned to 4 (values per byte)
+    if (wt == WeightsType::UINT2 && (weights.IFM().v % 4 != 0)) {
+        DO_NOT_USE_THIS_KERNEL(params.layerID);
+    }
+
+    // u2 packed weights are supported only in the default tiled kernel with os_iyx_osv16 weights layout,
+    // which doesn't support swiglu fusion (it requires os_is_yx_osv32_isv2 layout)
+    if (wt == WeightsType::UINT2 && is_swiglu_fused(fc_params)) {
         DO_NOT_USE_THIS_KERNEL(params.layerID);
     }
 
@@ -455,6 +467,16 @@ bool TuneParamsSelector::VerifyTuneParams(const fully_connected_params& params, 
         return true;
     }
 
+    if (params.compressed && params.weights.GetDType() == WeightsType::UINT2) {
+        // u2 packed weights are supported only in the default kernel with TILE_K_OFM being a multiple of 4
+        // (number of u2 values per byte) to keep packed reads byte-aligned
+        if (tparams.kernel_type == FullyConnected_bf_tiled::KernelType::SLM)
+            return false;
+        if ((tparams.tile_k * tparams.tile_ofm) % 4 != 0)
+            return false;
+        return true;
+    }
+
     // Reject tile sizes that are guaranteed to spill out of registers.
     unsigned acc_register_bytes = tparams.tile_b * tparams.tile_ofm * simd * BytesPerElement(params.inputs[0].GetDType());
     unsigned in_register_bytes = tparams.tile_b * tparams.tile_ifm * simd * BytesPerElement(params.inputs[0].GetDType());
@@ -490,6 +512,15 @@ FullyConnected_bf_tiled::GetAutoTuneParams(const fully_connected_params& params,
         max_tile_ofm *= 2;
 
     bool swiglu_fused = is_swiglu_fused(params);
+
+    if (params.weights.GetDType() == WeightsType::UINT2) {
+        // u2 packed weights: only the default tiled kernel with os_iyx_osv16 weights layout is supported
+        // (no SLM / dynamic quantization support). TILE_K * TILE_OFM == 4 keeps packed reads byte-aligned.
+        if (!params.is_shape_agnostic && batch == 1) {
+            return selector.Default(tune_params(1, 1, 4, 4, 1, 1, 1, EXE_MODE_DEFAULT));
+        }
+        return selector.Default(tune_params(8, 1, 1, 4, 1, 1, 1, EXE_MODE_DEFAULT));
+    }
 
     if (params.weights.GetDType() == WeightsType::UINT4 || params.weights.GetDType() == WeightsType::INT4 ||
         (is_weight_dyn_quantizable(params) && should_dynamic_quantize(params))) {
@@ -686,8 +717,8 @@ JitConstants FullyConnected_bf_tiled::GetJitConstants(const fully_connected_para
 
     bool add_decompress_scale_post_op = false;
     WeightsType weights_dt = params.weights.GetDType();
-    if (weights_dt == WeightsType::UINT4 || weights_dt == WeightsType::INT4) {
-        tile_k_ofm_packed /= 2;
+    if (weights_dt == WeightsType::UINT4 || weights_dt == WeightsType::INT4 || weights_dt == WeightsType::UINT2) {
+        tile_k_ofm_packed /= (weights_dt == WeightsType::UINT2) ? 4 : 2;
         jit.Merge(make_int4_packed_type_jit_constant("INT4_PACKED_TYPE", weights_dt, tile_k_ofm));
         const size_t scale_group_size = get_scale_group_size(params);
         // Do not use SCALE_POST_OP for SLM kernel, since it demonstrates worse performance
@@ -1032,6 +1063,10 @@ KernelsData FullyConnected_bf_tiled::GetTunedKernelsDataByIndex(const Params &pa
     WeightsLayout weights_layout = WeightsLayout::os_iyx_osv16;
     if (is_swiglu_fused(fc_params)) {
         weights_layout = WeightsLayout::os_is_yx_osv32_isv2;
+    } else if (fc_params.compressed && fc_params.weights.GetDType() == WeightsType::UINT2
+        && (fc_params.weights.GetLayout() == WeightsLayout::oiyx || fc_params.weights.GetLayout() == WeightsLayout::os_iyx_osv16)) {
+        // u2 packed weights are supported only in os_iyx_osv16 layout (repacked by reorder_weights_int4)
+        weights_layout = WeightsLayout::os_iyx_osv16;
     } else if (fc_params.compressed && fc_params.inputs[0].GetDType() == Datatype::F16
         && (fc_params.weights.GetLayout() == WeightsLayout::oiyx || fc_params.weights.GetLayout() == WeightsLayout::os_is_yx_osv64_isv2)
         && (fc_params.weights.GetDType() == WeightsType::INT4 || fc_params.weights.GetDType() == WeightsType::UINT4)

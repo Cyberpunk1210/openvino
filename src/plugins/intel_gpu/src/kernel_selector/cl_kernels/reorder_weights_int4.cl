@@ -6,6 +6,21 @@
 
 KERNEL(reorder_weights_int4)(const __global INPUT0_TYPE* input, __global OUTPUT_TYPE* output) {
 #if defined(INPUT0_LAYOUT_OIYX) && defined(OUTPUT_LAYOUT_OIYX)
+#if INT2_PACKED
+    // 2-bit packed weights padding: gather 4 values per output byte, zero-fill the padded area
+    const uint out_byte_offset = get_global_id(0);
+    OUTPUT_TYPE out = 0x0;
+    unroll_for (uint j = 0; j < 4; ++j) {
+        const uint output_index = out_byte_offset * 4 + j;
+        const uint w = output_index % OUTPUT_INNERMOST_NUM;
+        const uint h = output_index / OUTPUT_INNERMOST_NUM;
+        if (w < INPUT0_INNERMOST_NUM) {
+            const uint in_elem_offset = h * INPUT0_INNERMOST_NUM + w;
+            out |= ((input[in_elem_offset / 4] >> ((in_elem_offset % 4) * 2)) & 0x3) << (j * 2);
+        }
+    }
+    output[out_byte_offset] = out;
+#else
     const uint out_byte_offset = get_global_id(0);
     const uint output_index = out_byte_offset * 2;
     const uint w = output_index % OUTPUT_INNERMOST_NUM;
@@ -28,7 +43,21 @@ KERNEL(reorder_weights_int4)(const __global INPUT0_TYPE* input, __global OUTPUT_
         }
         output[out_byte_offset] = (out0 << 4) | out1;
     }
+#endif
 #elif defined(INPUT0_LAYOUT_IOYX) && defined(OUTPUT_LAYOUT_OIYX)
+#if INT2_PACKED
+    // 2-bit packed weights transpose: gather 4 values per output byte
+    const uint out_byte_offset = get_global_id(0);
+    OUTPUT_TYPE out = 0x0;
+    unroll_for (uint j = 0; j < 4; ++j) {
+        const uint offset = out_byte_offset * 4 + j;
+        const uint i = offset % OUTPUT_IFM_NUM;
+        const uint o = offset / OUTPUT_IFM_NUM;
+        const uint input_offset = GET_FILTER_INDEX(INPUT0, 0, o, i, 0, 0);
+        out |= ((input[input_offset / 4] >> ((input_offset % 4) * 2)) & 0x3) << (j * 2);
+    }
+    output[out_byte_offset] = out;
+#else
     const uint out_byte_offset = get_global_id(0);
 
     const uint offset0 = out_byte_offset * 2 + 0;
@@ -51,7 +80,23 @@ KERNEL(reorder_weights_int4)(const __global INPUT0_TYPE* input, __global OUTPUT_
 
     OUTPUT_TYPE out = in0 | (in1 << 4);
     output[out_byte_offset] = out;
+#endif
 #elif defined(OUTPUT_LAYOUT_OS_IYX_OSV16)
+#if INT2_PACKED
+    // osv16 layout for 2-bit packed weight (4 values per byte along IFM)
+    // f0_k0k1k2k3 | f1_k0k1k2k3 | ....  | f15_k0k1k2k3
+    // f0_k4k5k6k7 | f1_k4k5k6k7 | ....  | f15_k4k5k6k7
+    // ...
+    const unsigned o = (uint)get_global_id(0);
+    const unsigned i = (uint)get_global_id(1) * 4;
+
+    const uint input0_offset = GET_FILTER_INDEX(INPUT0, 0, o, i, 0, 0);
+
+    INPUT0_TYPE packed_out_channels = input[input0_offset / 4] & 0xFF;
+
+    const uint output_idx = GET_FILTER_OS_IYX_OSV_INDEX_INT2_PACKED(OUTPUT, o, i/4, 0, 0, 16); // Calculate offset as osv16 due to packing
+    output[output_idx] = packed_out_channels;
+#else
     // osv32_isv2 layout for int4 packed weight
     // f0_k0k1 | f1_k0k1 | ....  | f15_k0k1
     // f0_k2k3 | f1_k2k3 | ....  | f15_k2k3
@@ -72,6 +117,7 @@ KERNEL(reorder_weights_int4)(const __global INPUT0_TYPE* input, __global OUTPUT_
 
     const uint output_idx = GET_FILTER_OS_IYX_OSV_INDEX_INT4_PACKED(OUTPUT, o, i/2, 0, 0, 16); // Calculate offset as osv16 due to packing
     output[output_idx] = packed_out_channels;
+#endif
 #elif defined(OUTPUT_LAYOUT_OS_IYX_OSV32)
     // os_iyx osv32 layout for int4 packed weight
     // k0_f0f16 | k0_f1f17 | .... | k0_f15f31 || k1_f0f16 | k1_f1f17 | ... | k1_f15f31

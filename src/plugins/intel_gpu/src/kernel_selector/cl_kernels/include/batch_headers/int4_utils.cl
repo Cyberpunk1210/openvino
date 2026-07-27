@@ -14,6 +14,58 @@ typedef struct __attribute__ ((packed)) uint4x4_t { uint4x2_t s0; uint4x2_t s1; 
 typedef struct __attribute__ ((packed)) uint4x8_t { uint4x2_t s0; uint4x2_t s1; uint4x2_t s2; uint4x2_t s3; } uint4x8_t;
 typedef struct __attribute__ ((packed)) uint4x16_t { uint4x2_t s0; uint4x2_t s1; uint4x2_t s2; uint4x2_t s3; uint4x2_t s4; uint4x2_t s5; uint4x2_t s6; uint4x2_t s7; } uint4x16_t;
 
+// 2-bit unsigned packed types, 4 values per byte, LSB-first:
+// i-th value of a byte = (byte >> ((i % 4) * 2)) & 0x3
+typedef struct __attribute__ ((packed)) uint2x4_t { uchar s0; } uint2x4_t;
+typedef struct __attribute__ ((packed)) uint2x8_t { uint2x4_t s0; uint2x4_t s1; } uint2x8_t;
+typedef struct __attribute__ ((packed)) uint2x16_t { uint2x4_t s0; uint2x4_t s1; uint2x4_t s2; uint2x4_t s3; } uint2x16_t;
+
+inline uchar4 cvt_uint2x4_to_uint8x4(uint2x4_t v) __attribute__((overloadable)) {
+    const uchar v0 = v.s0 & 0x03;
+    const uchar v1 = (v.s0 >> 2) & 0x03;
+    const uchar v2 = (v.s0 >> 4) & 0x03;
+    const uchar v3 = (v.s0 >> 6) & 0x03;
+    return (uchar4)(v0, v1, v2, v3);
+}
+
+inline uchar4 unpack_to_uchar(uint2x4_t v) __attribute__((overloadable)) {
+    return cvt_uint2x4_to_uint8x4(v);
+}
+
+inline char4 unpack_to_char(uint2x4_t v) __attribute__((overloadable)) {
+    return convert_char4(cvt_uint2x4_to_uint8x4(v));
+}
+
+inline uchar8 unpack_to_uchar(uint2x8_t v) __attribute__((overloadable)) {
+    uchar4 v0 = unpack_to_uchar(v.s0);
+    uchar4 v1 = unpack_to_uchar(v.s1);
+    return (uchar8)(v0.s0, v0.s1, v0.s2, v0.s3, v1.s0, v1.s1, v1.s2, v1.s3);
+}
+
+inline char8 unpack_to_char(uint2x8_t v) __attribute__((overloadable)) {
+    char4 v0 = unpack_to_char(v.s0);
+    char4 v1 = unpack_to_char(v.s1);
+    return (char8)(v0.s0, v0.s1, v0.s2, v0.s3, v1.s0, v1.s1, v1.s2, v1.s3);
+}
+
+inline uchar16 unpack_to_uchar(uint2x16_t v) __attribute__((overloadable)) {
+    uchar4 v0 = unpack_to_uchar(v.s0);
+    uchar4 v1 = unpack_to_uchar(v.s1);
+    uchar4 v2 = unpack_to_uchar(v.s2);
+    uchar4 v3 = unpack_to_uchar(v.s3);
+    return (uchar16)(v0.s0, v0.s1, v0.s2, v0.s3, v1.s0, v1.s1, v1.s2, v1.s3,
+                     v2.s0, v2.s1, v2.s2, v2.s3, v3.s0, v3.s1, v3.s2, v3.s3);
+}
+
+inline char16 unpack_to_char(uint2x16_t v) __attribute__((overloadable)) {
+    char4 v0 = unpack_to_char(v.s0);
+    char4 v1 = unpack_to_char(v.s1);
+    char4 v2 = unpack_to_char(v.s2);
+    char4 v3 = unpack_to_char(v.s3);
+    return (char16)(v0.s0, v0.s1, v0.s2, v0.s3, v1.s0, v1.s1, v1.s2, v1.s3,
+                    v2.s0, v2.s1, v2.s2, v2.s3, v3.s0, v3.s1, v3.s2, v3.s3);
+}
+
 inline uchar cvt_uint8x2_to_uint4x2(uchar2 v) __attribute__((overloadable)) {
     uchar v0 = 0;
     v0 = (v.s1 & 0x0F) << 4;
@@ -185,6 +237,26 @@ inline float8 unpack_to_float(int4x8_t v) __attribute__((overloadable)) {
     return (float8)(f0.s0, f0.s1, f1.s0, f1.s1, f2.s0, f2.s1, f3.s0, f3.s1);
 }
 
+// For float (2-bit packed)
+inline float4 unpack_to_float(uint2x4_t v) __attribute__((overloadable)) {
+    return convert_float4(cvt_uint2x4_to_uint8x4(v));
+}
+
+inline float8 unpack_to_float(uint2x8_t v) __attribute__((overloadable)) {
+    float4 f0 = unpack_to_float(v.s0);
+    float4 f1 = unpack_to_float(v.s1);
+    return (float8)(f0.s0, f0.s1, f0.s2, f0.s3, f1.s0, f1.s1, f1.s2, f1.s3);
+}
+
+inline float16 unpack_to_float(uint2x16_t v) __attribute__((overloadable)) {
+    float4 f0 = unpack_to_float(v.s0);
+    float4 f1 = unpack_to_float(v.s1);
+    float4 f2 = unpack_to_float(v.s2);
+    float4 f3 = unpack_to_float(v.s3);
+    return (float16)(f0.s0, f0.s1, f0.s2, f0.s3, f1.s0, f1.s1, f1.s2, f1.s3,
+                     f2.s0, f2.s1, f2.s2, f2.s3, f3.s0, f3.s1, f3.s2, f3.s3);
+}
+
 #if defined(cl_khr_fp16)
 inline half2 unpack_to_half(uint4x2_t v) __attribute__((overloadable)) {
     return convert_half2(cvt_uint4x2_to_uint8x2(v));
@@ -274,11 +346,32 @@ inline uchar8 unpack_to_uchar_osv32_isv2(uint4x8_t v) __attribute__((overloadabl
     return (uchar8)(v0.s0, v0.s1, v1.s0, v1.s1, v2.s0, v2.s1, v3.s0, v3.s1);
 }
 
+// For half (2-bit packed)
+inline half4 unpack_to_half(uint2x4_t v) __attribute__((overloadable)) {
+    return convert_half4(cvt_uint2x4_to_uint8x4(v));
+}
+
+inline half8 unpack_to_half(uint2x8_t v) __attribute__((overloadable)) {
+    half4 f0 = unpack_to_half(v.s0);
+    half4 f1 = unpack_to_half(v.s1);
+    return (half8)(f0.s0, f0.s1, f0.s2, f0.s3, f1.s0, f1.s1, f1.s2, f1.s3);
+}
+
+inline half16 unpack_to_half(uint2x16_t v) __attribute__((overloadable)) {
+    half4 f0 = unpack_to_half(v.s0);
+    half4 f1 = unpack_to_half(v.s1);
+    half4 f2 = unpack_to_half(v.s2);
+    half4 f3 = unpack_to_half(v.s3);
+    return (half16)(f0.s0, f0.s1, f0.s2, f0.s3, f1.s0, f1.s1, f1.s2, f1.s3,
+                    f2.s0, f2.s1, f2.s2, f2.s3, f3.s0, f3.s1, f3.s2, f3.s3);
+}
+
 
 #endif  // defined(cl_khr_fp16)
 
 
 #define UNPACK_INT4x2(target_type, value) CAT(unpack_to_, target_type)(value)
+#define UNPACK_INT2x4(target_type, value) CAT(unpack_to_, target_type)(value)
 #define UNPACK_INT4x2_OSV32_ISV2(target_type, value) CAT(CAT(unpack_to_, target_type), _osv32_isv2)(value)
 #define UNPACK_INT4x4_OSV32_ISV2(target_type, value) CAT(CAT(unpack_to_, target_type), _osv32_isv2)(value)
 #define UNPACK_TRANSPOSED_INT4x2(target_type, value) CAT(unpack_transposed_to_, target_type)(value)

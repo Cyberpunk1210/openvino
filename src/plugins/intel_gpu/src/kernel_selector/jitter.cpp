@@ -132,6 +132,7 @@ std::string toCLType(WeightsType wType) {
         case WeightsType::INT8:
             return GetTypeName<int8_t>();
         case WeightsType::UINT4:
+        case WeightsType::UINT2:
         case WeightsType::UINT8:
             return GetTypeName<uint8_t>();
         case WeightsType::F16:
@@ -151,6 +152,7 @@ std::string toCLType(Datatype dType) {
         case Datatype::INT8:
             return GetTypeName<int8_t>();
         case Datatype::UINT4:
+        case Datatype::UINT2:
         case Datatype::UINT8:
             return GetTypeName<uint8_t>();
         case Datatype::INT16:
@@ -1587,6 +1589,13 @@ JitConstants MakeTypeJitConstants(Datatype dataType, const std::string& macroNam
             type_size = "0.5f";
             is_fp = false;
             break;
+        case Datatype::UINT2:
+            type = "uchar";
+            to_type = "convert_uchar(v)";
+            to_type_sat = "convert_uchar_sat(v)";
+            type_size = "0.25f";
+            is_fp = false;
+            break;
         case Datatype::BF16:
             type = "ushort";
             val_one = "(ushort) 1";
@@ -1681,6 +1690,8 @@ JitConstants MakeTypeJitConstants(WeightsType weightsType, const std::string& ma
             return MakeTypeJitConstants(Datatype::INT4, macroName);
         case WeightsType::UINT4:
             return MakeTypeJitConstants(Datatype::UINT4, macroName);
+        case WeightsType::UINT2:
+            return MakeTypeJitConstants(Datatype::UINT2, macroName);
         case WeightsType::INT32:
             return MakeTypeJitConstants(Datatype::INT32, macroName);
         case WeightsType::BF16:
@@ -1703,6 +1714,10 @@ JitConstants make_int4_packed_type_jit_constant(const std::string& macro_name, W
     switch (wt) {
         case WeightsType::UINT4: type_string = "uint4x"; break;
         case WeightsType::INT4: type_string = "int4x"; break;
+        case WeightsType::UINT2:
+            OPENVINO_ASSERT(pack_size % 4 == 0, "[GPU] uint2 packed type requires pack size to be a multiple of 4");
+            type_string = "uint2x";
+            break;
         default: OPENVINO_THROW("[GPU] Unsupported compressed type");
     }
     return { MakeJitConstant(macro_name, type_string + std::to_string(pack_size) + "_t") };

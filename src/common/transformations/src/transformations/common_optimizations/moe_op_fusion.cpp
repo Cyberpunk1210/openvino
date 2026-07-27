@@ -154,6 +154,43 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp(bool ha
         const bool is_compressed = is_gate_compressed;
 
         if (is_compressed) {
+            auto gate_zp = pm.at(gate_zp_m);
+            auto up_zp = pm.at(up_zp_m);
+            auto down_zp = pm.at(down_zp_m);
+
+            // A scalar (rank-0) zp constant is a folded per-tensor zero point that
+            // MOE/MOECompressed and their plugin implementations cannot consume.
+            // An all-zero scalar zp is equivalent to symmetric quantization: normalize
+            // it to the "absent zp" convention (dynamic-typed empty constant).
+            // Anything else (non-constant, non-zero, or mixed sym/asym forms) bails
+            // out and leaves the graph in the GatherMatmul form.
+            auto normalize_scalar_zp = [](ov::Output<ov::Node>& zp) -> bool {
+                const auto& zp_shape = zp.get_partial_shape();
+                if (!zp_shape.is_static() || zp_shape.rank().get_length() != 0) {
+                    return true;  // not a scalar zp: nothing to do
+                }
+                const auto zp_const = ov::as_type_ptr<v0::Constant>(zp.get_node_shared_ptr());
+                if (!zp_const) {
+                    return false;
+                }
+                for (const auto v : zp_const->cast_vector<int64_t>()) {
+                    if (v != 0) {
+                        return false;
+                    }
+                }
+                zp = std::make_shared<v0::Constant>(ov::element::dynamic, ov::Shape{0});
+                return true;
+            };
+            if (!normalize_scalar_zp(gate_zp) || !normalize_scalar_zp(up_zp) || !normalize_scalar_zp(down_zp)) {
+                return false;
+            }
+            const size_t num_dynamic_zp = static_cast<size_t>(gate_zp.get_element_type() == ov::element::dynamic) +
+                                          static_cast<size_t>(up_zp.get_element_type() == ov::element::dynamic) +
+                                          static_cast<size_t>(down_zp.get_element_type() == ov::element::dynamic);
+            if (num_dynamic_zp != 0 && num_dynamic_zp != 3) {
+                return false;  // mixed symmetric/asymmetric GEMMs are not supported
+            }
+
             // Build MOECompressed with 12 inputs: hidden, routing, topk,
             // gate_w, gate_scale, gate_zp, up_w, up_scale, up_zp, down_w, down_scale, down_zp
             ov::OutputVector moe_inputs = {
@@ -162,13 +199,13 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp(bool ha
                 topk_indices,
                 gate_w,
                 pm.at(gate_scale_m),
-                pm.at(gate_zp_m),
+                gate_zp,
                 up_w,
                 pm.at(up_scale_m),
-                pm.at(up_zp_m),
+                up_zp,
                 down_w,
                 pm.at(down_scale_m),
-                pm.at(down_zp_m),
+                down_zp,
             };
 
             // Populate compressed config from weight shapes
@@ -187,7 +224,7 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp(bool ha
             const size_t group_size =
                 (down_num_groups <= 1) ? std::numeric_limits<size_t>::max() : (down_K / down_num_groups);
             // dynamic-typed zp = symmetric placeholder.
-            const bool has_zp = pm.at(gate_zp_m).get_element_type() != ov::element::dynamic;
+            const bool has_zp = num_dynamic_zp == 0;
 
             MOECompressed::Config compressed_config{
                 {ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU, 0.0f, expert_beta, 0, activation_type},

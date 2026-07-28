@@ -158,13 +158,21 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp(bool ha
             auto up_zp = pm.at(up_zp_m);
             auto down_zp = pm.at(down_zp_m);
 
-            // A scalar (rank-0) zp constant is a folded per-tensor zero point that
-            // MOE/MOECompressed and their plugin implementations cannot consume.
+            // Whether expert weights are u2: non-zero scalar zp broadcast is only
+            // implemented for the u2 batched GEMV kernels (other dtypes keep the
+            // GatherMatmul form, where their optimized paths still work).
+            const bool weights_are_u2 = pm.at(gate_w_m).get_element_type() == ov::element::u2;
+
+            // A scalar (rank-0) zp constant is a folded per-tensor zero point.
             // An all-zero scalar zp is equivalent to symmetric quantization: normalize
             // it to the "absent zp" convention (dynamic-typed empty constant).
-            // Anything else (non-constant, non-zero, or mixed sym/asym forms) bails
-            // out and leaves the graph in the GatherMatmul form.
-            auto normalize_scalar_zp = [](ov::Output<ov::Node>& zp) -> bool {
+            // A non-zero scalar zp is passed through unchanged (u2 weights only):
+            // MOE validation explicitly exempts rank-0 inputs from the num_experts
+            // check, and the batched GEMV kernels broadcast the single element over
+            // all experts/groups/channels.
+            // Anything else (non-constant, packed dtype, or mixed sym/asym forms)
+            // bails out and leaves the graph in the GatherMatmul form.
+            auto normalize_scalar_zp = [&](ov::Output<ov::Node>& zp) -> bool {
                 const auto& zp_shape = zp.get_partial_shape();
                 if (!zp_shape.is_static() || zp_shape.rank().get_length() != 0) {
                     return true;  // not a scalar zp: nothing to do
@@ -173,9 +181,22 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp(bool ha
                 if (!zp_const) {
                     return false;
                 }
+                // Restrict to byte/wide integer types: cast_vector on packed (u2/u4/i4)
+                // constants is not meaningful here and may throw.
+                const auto zp_et = zp_const->get_element_type();
+                if (zp_et != ov::element::i8 && zp_et != ov::element::u8 && zp_et != ov::element::i32 &&
+                    zp_et != ov::element::u32 && zp_et != ov::element::i64) {
+                    return false;
+                }
                 for (const auto v : zp_const->cast_vector<int64_t>()) {
                     if (v != 0) {
-                        return false;
+                        if (!weights_are_u2) {
+                            return false;  // non-zero scalar zp only supported for u2 weights
+                        }
+                        // Keep the rank-0 scalar constant as-is: MOE validation exempts
+                        // rank-0 inputs from the num_experts check, and the u2 batched
+                        // GEMV kernels broadcast the single element (MOE_ZP_SCALAR).
+                        return true;
                     }
                 }
                 zp = std::make_shared<v0::Constant>(ov::element::dynamic, ov::Shape{0});

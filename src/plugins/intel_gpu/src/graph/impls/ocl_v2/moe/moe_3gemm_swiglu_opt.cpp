@@ -421,6 +421,18 @@ static void add_common_consts(const RuntimeParams& params, JitConstants& jit) {
     jit.make("MOE_DTYPE", params.get_input_layout(0).data_type == ov::element::f16 ? "half" : "float");
     jit.make("MOE_DTYPE_SIZE", params.get_input_layout(0).data_type == ov::element::f16 ? 2 : 4);
     jit.make("HAS_ZP", desc->_config.has_zp ? 1 : 0);
+    if (desc->_config.has_zp) {
+        // Scalar (per-tensor) zp: a single element broadcast over all experts/groups/channels.
+        // Produced by moe_op_fusion for u2 weights with a folded scalar zp constant.
+        const auto& zp_layout = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::ZP_0));
+        if (zp_layout.count() == 1) {
+            OPENVINO_ASSERT(zp_layout.data_type == ov::element::i8 || zp_layout.data_type == ov::element::u8,
+                            "Scalar MoE zp must be i8/u8, got ",
+                            zp_layout.data_type);
+            jit.make("MOE_ZP_SCALAR", 1);
+            jit.make("MOE_ZP_SCALAR_DT", zp_layout.data_type == ov::element::i8 ? "char" : "uchar");
+        }
+    }
 
     ov::element::Type weight_dt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_0)).data_type;
     bool is_signed_weight = (weight_dt == ov::element::i4 || weight_dt == ov::element::i8);

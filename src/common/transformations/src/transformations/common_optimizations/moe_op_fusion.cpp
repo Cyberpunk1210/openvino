@@ -163,12 +163,13 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp(bool ha
             // GatherMatmul form, where their optimized paths still work).
             const bool weights_are_u2 = pm.at(gate_w_m).get_element_type() == ov::element::u2;
 
-            // A scalar (rank-0) zp constant is a folded per-tensor zero point that
-            // MOE/MOECompressed per-group zp indexing cannot consume directly.
+            // A scalar (rank-0) zp constant is a folded per-tensor zero point.
             // An all-zero scalar zp is equivalent to symmetric quantization: normalize
             // it to the "absent zp" convention (dynamic-typed empty constant).
-            // A non-zero scalar zp is kept as a 1-element tensor (u2 weights only):
-            // the batched GEMV kernels broadcast it over all experts/groups/channels.
+            // A non-zero scalar zp is passed through unchanged (u2 weights only):
+            // MOE validation explicitly exempts rank-0 inputs from the num_experts
+            // check, and the batched GEMV kernels broadcast the single element over
+            // all experts/groups/channels.
             // Anything else (non-constant, packed dtype, or mixed sym/asym forms)
             // bails out and leaves the graph in the GatherMatmul form.
             auto normalize_scalar_zp = [&](ov::Output<ov::Node>& zp) -> bool {
@@ -192,7 +193,9 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp(bool ha
                         if (!weights_are_u2) {
                             return false;  // non-zero scalar zp only supported for u2 weights
                         }
-                        zp = std::make_shared<v0::Constant>(zp_et, ov::Shape{1}, zp_const->get_data_ptr());
+                        // Keep the rank-0 scalar constant as-is: MOE validation exempts
+                        // rank-0 inputs from the num_experts check, and the u2 batched
+                        // GEMV kernels broadcast the single element (MOE_ZP_SCALAR).
                         return true;
                     }
                 }

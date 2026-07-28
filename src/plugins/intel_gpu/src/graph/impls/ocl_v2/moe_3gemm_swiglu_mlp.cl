@@ -89,6 +89,14 @@ inline float moe_mlp_fast_erf(float x) {
 // 2-bit (u2) dequant: 4 values per byte, LSB-first; u2 weights are always unsigned.
 #define DEQUANT_2BIT(v, s) convert_half(((v) >> (s)) & 0x3)
 
+// Scalar (per-tensor) zp broadcast: no per-expert stride, the single element is
+// read directly as MOE_ZP_SCALAR_DT instead of packed per-group zp indexing.
+#if defined(MOE_ZP_SCALAR)
+#    define ZP_EXPERT_STRIDE 0
+#else
+#    define ZP_EXPERT_STRIDE expert_zp_size
+#endif
+
 #if GATE_UP_ENABLE
 inline void gate_up_gemv_n2x_u4(const __global uchar* weight,
                                 __global half* scales,
@@ -247,10 +255,16 @@ inline void gate_up_gemv_n2x_u2(const __global uchar* weight,
             half s0 = S[scale_offset];
             half s1 = S[scale_offset + 1];
 #if HAS_ZP
+#        ifdef MOE_ZP_SCALAR
+            // Scalar (per-tensor) zp: single element broadcast over all experts/groups/channels.
+            const half z_hf0 = convert_half(((__global MOE_ZP_SCALAR_DT*)zps)[0]);
+            const half z_hf1 = z_hf0;
+#        else
             int zp_offset = (gk * FAKE_GROUP_SIZE / GATE_UP_GROUP_SIZE) * N / 4;
             uchar z = Z[zp_offset];
             half z_hf0 = convert_half((z >> zshift) & 0x3);
             half z_hf1 = convert_half((z >> (zshift + 2)) & 0x3);
+#        endif
 #endif
 
 #    if ELEMS_PER_LANE == 4
@@ -635,12 +649,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
         // gate, [HIDDEN_SIZE, INTERMEDIATE_SIZE]
         gate_weight = (__global MOE_WEI_DT*)(gate_weight_addr + expert_id * expert_wei_size);
         gate_scale = (__global MOE_SCALE_DT*)(gate_scale_addr + expert_id * expert_scale_size);
-        gate_zp = (__global MOE_ZP_DT*)(gate_zp_addr + expert_id * expert_zp_size);
+        gate_zp = (__global MOE_ZP_DT*)(gate_zp_addr + expert_id * ZP_EXPERT_STRIDE);
 
         // up, [HIDDEN_SIZE, INTERMEDIATE_SIZE]
         up_weight = (__global MOE_WEI_DT*)(up_weight_addr + expert_id * expert_wei_size);
         up_scale = (__global MOE_SCALE_DT*)(up_scale_addr + expert_id * expert_scale_size);
-        up_zp = (__global MOE_ZP_DT*)(up_zp_addr + expert_id * expert_zp_size);
+        up_zp = (__global MOE_ZP_DT*)(up_zp_addr + expert_id * ZP_EXPERT_STRIDE);
     }
 #    if SHARED_EXPERT_ENABLE
     else {
@@ -931,10 +945,16 @@ inline void down_gemv_n2x_u2(const __global uchar* weight,
             half s0 = S[scale_offset];
             half s1 = S[scale_offset + 1];
 #if HAS_ZP
+#        ifdef MOE_ZP_SCALAR
+            // Scalar (per-tensor) zp: single element broadcast over all experts/groups/channels.
+            const half z_hf0 = convert_half(((__global MOE_ZP_SCALAR_DT*)zps)[0]);
+            const half z_hf1 = z_hf0;
+#        else
             int zp_offset = (gk * FAKE_GROUP_SIZE / DOWN_GROUP_SIZE) * N / 4;
             uchar z = Z[zp_offset];
             half z_hf0 = convert_half((z >> zshift) & 0x3);
             half z_hf1 = convert_half((z >> (zshift + 2)) & 0x3);
+#        endif
 #endif
 
 #    if ELEMS_PER_LANE == 4
@@ -1289,7 +1309,7 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
         // down, [INTERMEDIATE_SIZE, HIDDEN_SIZE]
         weight = (__global MOE_WEI_DT*)(down_weight_addr + expert_id * expert_wei_size);
         scales = (__global MOE_SCALE_DT*)(down_scale_addr + expert_id * expert_scale_size);
-        zps = (__global MOE_ZP_DT*)(down_zp_addr + expert_id * expert_zp_size);
+        zps = (__global MOE_ZP_DT*)(down_zp_addr + expert_id * ZP_EXPERT_STRIDE);
     }
 #    if SHARED_EXPERT_ENABLE
     else {

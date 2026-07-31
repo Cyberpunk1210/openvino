@@ -97,7 +97,46 @@ inline float moe_mlp_fast_erf(float x) {
 #    define ZP_EXPERT_STRIDE expert_zp_size
 #endif
 
-#if GATE_UP_ENABLE
+// A3 per-GEMM helpers (mixed-dtype MoE): per-expert byte strides given a compression
+// code DT (0=u4/i4, 1=u8/i8, 2=f16, 3=u2) and group size GS. N*K equals
+// INTERMEDIATE_SIZE*HIDDEN_SIZE for all three GEMMs, so one product serves gate/up/down.
+#define MOE_WEI_PROD (INTERMEDIATE_SIZE * HIDDEN_SIZE)
+#define MOE_EXPERT_WEI_BYTES(DT) ((DT) == 0 ? (MOE_WEI_PROD) / 2 : (DT) == 3 ? (MOE_WEI_PROD) / 4 : (MOE_WEI_PROD))
+#define MOE_EXPERT_ZP_BYTES(DT, GS) \
+    ((DT) == 0 ? (MOE_WEI_PROD) / 2 / (GS) : (DT) == 3 ? (MOE_WEI_PROD) / 4 / (GS) : (MOE_WEI_PROD) / (GS))
+
+#if defined(U2_UNPACK_ENABLE)
+
+// Unpacks u2-packed data (4 values per byte, LSB-first) into u4-packed data
+// (2 values per byte, LSB-first), doubling the byte size while preserving the
+// logical element order. Used to feed u2 MoE expert weights/zp to the u4-only
+// prefill GEMM paths (micro-gemm/oneDNN have no u2 dtype).
+inline uint moe_unpack_u2_byte(uint b) {
+    // byte (v3 v2 v1 v0) -> uint16 ((v3 | v2 << 4) << 8) | (v0 | v1 << 4)
+    return (b & 0x3u) | ((b & 0xCu) << 2) | ((b & 0x30u) << 4) | ((b & 0xC0u) << 6);
+}
+
+// broadcast_zp == 0: src holds src_count uints of u2-packed data; each work item
+//                    unpacks one uint (4 bytes) into 2 uints (8 bytes) of u4 data.
+// broadcast_zp != 0: src holds a single scalar zp element (byte); each work item
+//                    replicates it into both nibbles of one output byte, so a
+//                    per-tensor zp is materialized as a full u4 zp tensor and
+//                    src_count is the output byte count.
+KERNEL(moe_unpack_u2_to_u4)(const __global uchar* src, __global uchar* dst, int src_count, int broadcast_zp) {
+    const size_t i = get_global_id(0);
+    if (i >= (size_t)src_count)
+        return;
+    if (broadcast_zp != 0) {
+        const uint v = src[0];
+        dst[i] = (uchar)(v | (v << 4));
+        return;
+    }
+    const uint v = ((const __global uint*)src)[i];
+    ((__global uint*)dst)[2 * i] = moe_unpack_u2_byte(v & 0xFFu) | (moe_unpack_u2_byte((v >> 8) & 0xFFu) << 16);
+    ((__global uint*)dst)[2 * i + 1] = moe_unpack_u2_byte((v >> 16) & 0xFFu) | (moe_unpack_u2_byte(v >> 24) << 16);
+}
+
+#elif GATE_UP_ENABLE
 inline void gate_up_gemv_n2x_u4(const __global uchar* weight,
                                 __global half* scales,
                                 __global uchar* zps,
@@ -271,7 +310,7 @@ inline void gate_up_gemv_n2x_u2(const __global uchar* weight,
             // Each lane reads 4 K-elements (1 byte = 4 x 2-bit values).
             half2 sum0;
             half2 sum1;
-            half4 a = as_half4(_sub_group_block_read_slm_us4((const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
+            half4 a = vload4(id_local, x2 + gk * FAKE_GROUP_SIZE);
             uchar b = intel_sub_group_block_read_uc((const __global uchar*)B + gk * FAKE_GROUP_SIZE / 4);
             uchar b2 = intel_sub_group_block_read_uc((const __global uchar*)(B + (K / 4) + gk * FAKE_GROUP_SIZE / 4));
 
@@ -294,9 +333,12 @@ inline void gate_up_gemv_n2x_u2(const __global uchar* weight,
 #    endif
 #    elif ELEMS_PER_LANE == 2
             // Each lane handles 2 K-elements; two lanes share one packed byte.
+            // NOTE: keep per-lane scalar loads here. A subgroup block read would make
+            // lanes >= FAKE_GROUP_SIZE/4 read past the tile, and at the end of the
+            // mmap'd weights buffer that overhang faults (CL_OUT_OF_RESOURCES).
             half sum0;
             half sum1;
-            half2 a = as_half2(_sub_group_block_read_slm_us2((const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
+            half2 a = vload2(id_local, x2 + gk * FAKE_GROUP_SIZE);
             uchar b = B[gk * FAKE_GROUP_SIZE / 4 + (id_local >> 1)];
             uchar b2 = B[(K / 4) + gk * FAKE_GROUP_SIZE / 4 + (id_local >> 1)];
             const int wshift = (id_local & 1) * 4;
@@ -317,7 +359,7 @@ inline void gate_up_gemv_n2x_u2(const __global uchar* weight,
 #    else
             half4 sum0;
             half4 sum1;
-            half8 a = as_half8(_sub_group_block_read_slm_us8((const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
+            half8 a = vload8(id_local, x2 + gk * FAKE_GROUP_SIZE);
             uchar2 b = intel_sub_group_block_read_uc2((const __global uchar*)B + gk * FAKE_GROUP_SIZE / 4);
             uchar2 b2 = intel_sub_group_block_read_uc2((const __global uchar*)(B + (K / 4) + gk * FAKE_GROUP_SIZE / 4));
 
@@ -620,19 +662,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
     bool is_shared = false;
 #    endif
 
-#    if WEIGHT_COMPRESSEION_DT == 0
-    const int expert_wei_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / 2;
-    const int expert_scale_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / GATE_UP_GROUP_SIZE;
-    const int expert_zp_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / 2 / GATE_UP_GROUP_SIZE;
-#    elif WEIGHT_COMPRESSEION_DT == 3
-    const int expert_wei_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / 4;
-    const int expert_scale_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / GATE_UP_GROUP_SIZE;
-    const int expert_zp_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / 4 / GATE_UP_GROUP_SIZE;
-#    else
-    const int expert_wei_size = INTERMEDIATE_SIZE * HIDDEN_SIZE;
-    const int expert_scale_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / GATE_UP_GROUP_SIZE;
-    const int expert_zp_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / GATE_UP_GROUP_SIZE;
-#    endif
+    // A3 per-GEMM strides (gate and up may differ in dtype/zp-mode).
+    const int gate_expert_wei_size = MOE_EXPERT_WEI_BYTES(GATE_WEIGHT_DT);
+    const int up_expert_wei_size = MOE_EXPERT_WEI_BYTES(UP_WEIGHT_DT);
+    const int expert_scale_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / GATE_UP_GROUP_SIZE;  // f16 scale, dtype-independent
+    const int gate_zp_stride = GATE_ZP_SCALAR ? 0 : MOE_EXPERT_ZP_BYTES(GATE_WEIGHT_DT, GATE_UP_GROUP_SIZE);
+    const int up_zp_stride = UP_ZP_SCALAR ? 0 : MOE_EXPERT_ZP_BYTES(UP_WEIGHT_DT, GATE_UP_GROUP_SIZE);
 
     int expert_id = 0;
     // gate, [HIDDEN_SIZE, INTERMEDIATE_SIZE]
@@ -647,14 +682,14 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
     if (!is_shared) {
         expert_id = expert_list[token_idx * MAX_TOPK + expert_slot];
         // gate, [HIDDEN_SIZE, INTERMEDIATE_SIZE]
-        gate_weight = (__global MOE_WEI_DT*)(gate_weight_addr + expert_id * expert_wei_size);
+        gate_weight = (__global MOE_WEI_DT*)(gate_weight_addr + expert_id * gate_expert_wei_size);
         gate_scale = (__global MOE_SCALE_DT*)(gate_scale_addr + expert_id * expert_scale_size);
-        gate_zp = (__global MOE_ZP_DT*)(gate_zp_addr + expert_id * ZP_EXPERT_STRIDE);
+        gate_zp = (__global MOE_ZP_DT*)(gate_zp_addr + expert_id * gate_zp_stride);
 
         // up, [HIDDEN_SIZE, INTERMEDIATE_SIZE]
-        up_weight = (__global MOE_WEI_DT*)(up_weight_addr + expert_id * expert_wei_size);
+        up_weight = (__global MOE_WEI_DT*)(up_weight_addr + expert_id * up_expert_wei_size);
         up_scale = (__global MOE_SCALE_DT*)(up_scale_addr + expert_id * expert_scale_size);
-        up_zp = (__global MOE_ZP_DT*)(up_zp_addr + expert_id * ZP_EXPERT_STRIDE);
+        up_zp = (__global MOE_ZP_DT*)(up_zp_addr + expert_id * up_zp_stride);
     }
 #    if SHARED_EXPERT_ENABLE
     else {
@@ -686,7 +721,7 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
     __local float shared_gate_partial[SUBGROUP_NUM];  // one slot per subgroup for scalar gate reduction
 #    endif
 
-#    if WEIGHT_COMPRESSEION_DT == 0
+#    if GATE_WEIGHT_DT == 0
     //# interleaving x into x2
     int id_sg = get_sub_group_id();
     int num_sg = get_num_sub_groups();
@@ -778,17 +813,23 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
     // shared_gate_out[token_idx] is consumed by the next kernel (mlp_down) — no barrier needed here.
 #    endif
 
-#    if WEIGHT_COMPRESSEION_DT == 0
+    // A3: dispatch up (silu=false) then gate (silu=true) by each projection's own dtype.
+#    if UP_WEIGHT_DT == 0
     gate_up_gemv_n2x_u4(up_weight, up_scale, up_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, xg_sum, false);
-    gate_up_gemv_n2x_u4(gate_weight, gate_scale, gate_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, xg_sum, true);
-#    elif WEIGHT_COMPRESSEION_DT == 1
+#    elif UP_WEIGHT_DT == 1
     gate_up_gemv_n2x_u8(up_weight, up_scale, up_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, xg_sum, false);
-    gate_up_gemv_n2x_u8(gate_weight, gate_scale, gate_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, xg_sum, true);
-#    elif WEIGHT_COMPRESSEION_DT == 2
+#    elif UP_WEIGHT_DT == 2
     gate_up_gemv_n2x_f16(up_weight, up_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, false);
-    gate_up_gemv_n2x_f16(gate_weight, gate_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, true);
-#    elif WEIGHT_COMPRESSEION_DT == 3
+#    elif UP_WEIGHT_DT == 3
     gate_up_gemv_n2x_u2(up_weight, up_scale, up_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, xg_sum, false);
+#    endif
+#    if GATE_WEIGHT_DT == 0
+    gate_up_gemv_n2x_u4(gate_weight, gate_scale, gate_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, xg_sum, true);
+#    elif GATE_WEIGHT_DT == 1
+    gate_up_gemv_n2x_u8(gate_weight, gate_scale, gate_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, xg_sum, true);
+#    elif GATE_WEIGHT_DT == 2
+    gate_up_gemv_n2x_f16(gate_weight, gate_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, true);
+#    elif GATE_WEIGHT_DT == 3
     gate_up_gemv_n2x_u2(gate_weight, gate_scale, gate_zp, y, INTERMEDIATE_SIZE, HIDDEN_SIZE, x2, xg_sum, true);
 #    endif
 }
@@ -961,7 +1002,7 @@ inline void down_gemv_n2x_u2(const __global uchar* weight,
             // Each lane reads 4 K-elements (1 byte = 4 x 2-bit values).
             half2 sum0;
             half2 sum1;
-            half4 a = as_half4(_sub_group_block_read_slm_us4((const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
+            half4 a = vload4(id_local, x2 + gk * FAKE_GROUP_SIZE);
             uchar b = intel_sub_group_block_read_uc((const __global uchar*)B + gk * FAKE_GROUP_SIZE / 4);
             uchar b2 = intel_sub_group_block_read_uc((const __global uchar*)(B + (K / 4) + gk * FAKE_GROUP_SIZE / 4));
 
@@ -984,9 +1025,12 @@ inline void down_gemv_n2x_u2(const __global uchar* weight,
 #    endif
 #    elif ELEMS_PER_LANE == 2
             // Each lane handles 2 K-elements; two lanes share one packed byte.
+            // NOTE: keep per-lane scalar loads here. A subgroup block read would make
+            // lanes >= FAKE_GROUP_SIZE/4 read past the tile, and at the end of the
+            // mmap'd weights buffer that overhang faults (CL_OUT_OF_RESOURCES).
             half sum0;
             half sum1;
-            half2 a = as_half2(_sub_group_block_read_slm_us2((const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
+            half2 a = vload2(id_local, x2 + gk * FAKE_GROUP_SIZE);
             uchar b = B[gk * FAKE_GROUP_SIZE / 4 + (id_local >> 1)];
             uchar b2 = B[(K / 4) + gk * FAKE_GROUP_SIZE / 4 + (id_local >> 1)];
             const int wshift = (id_local & 1) * 4;
@@ -1007,7 +1051,7 @@ inline void down_gemv_n2x_u2(const __global uchar* weight,
 #    else
             half4 sum0;
             half4 sum1;
-            half8 a = as_half8(_sub_group_block_read_slm_us8((const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
+            half8 a = vload8(id_local, x2 + gk * FAKE_GROUP_SIZE);
             uchar2 b = intel_sub_group_block_read_uc2((const __global uchar*)B + gk * FAKE_GROUP_SIZE / 4);
             uchar2 b2 = intel_sub_group_block_read_uc2((const __global uchar*)(B + (K / 4) + gk * FAKE_GROUP_SIZE / 4));
 
@@ -1284,19 +1328,10 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
     bool is_shared = false;
 #    endif
 
-#    if WEIGHT_COMPRESSEION_DT == 0
-    const int expert_wei_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / 2;
-    const int expert_scale_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / DOWN_GROUP_SIZE;
-    const int expert_zp_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / 2 / DOWN_GROUP_SIZE;
-#    elif WEIGHT_COMPRESSEION_DT == 3
-    const int expert_wei_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / 4;
-    const int expert_scale_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / DOWN_GROUP_SIZE;
-    const int expert_zp_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / 4 / DOWN_GROUP_SIZE;
-#    else
-    const int expert_wei_size = INTERMEDIATE_SIZE * HIDDEN_SIZE;
-    const int expert_scale_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / DOWN_GROUP_SIZE;
-    const int expert_zp_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / DOWN_GROUP_SIZE;
-#    endif
+    // A3 per-GEMM strides for the down projection.
+    const int expert_wei_size = MOE_EXPERT_WEI_BYTES(DOWN_WEIGHT_DT);
+    const int expert_scale_size = INTERMEDIATE_SIZE * HIDDEN_SIZE / DOWN_GROUP_SIZE;  // f16 scale, dtype-independent
+    const int down_zp_stride = DOWN_ZP_SCALAR ? 0 : MOE_EXPERT_ZP_BYTES(DOWN_WEIGHT_DT, DOWN_GROUP_SIZE);
     int expert_id = 0;
 
     // down, [INTERMEDIATE_SIZE, HIDDEN_SIZE]
@@ -1309,7 +1344,7 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
         // down, [INTERMEDIATE_SIZE, HIDDEN_SIZE]
         weight = (__global MOE_WEI_DT*)(down_weight_addr + expert_id * expert_wei_size);
         scales = (__global MOE_SCALE_DT*)(down_scale_addr + expert_id * expert_scale_size);
-        zps = (__global MOE_ZP_DT*)(down_zp_addr + expert_id * ZP_EXPERT_STRIDE);
+        zps = (__global MOE_ZP_DT*)(down_zp_addr + expert_id * down_zp_stride);
     }
 #    if SHARED_EXPERT_ENABLE
     else {
@@ -1336,7 +1371,7 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
     __local float xg_sum[1];  // unused placeholder for function signature
 #endif
 
-#    if WEIGHT_COMPRESSEION_DT == 0
+#    if DOWN_WEIGHT_DT == 0
     //# interleaving x into x2
     int id_sg = get_sub_group_id();
     int num_sg = get_num_sub_groups();
@@ -1400,13 +1435,13 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
     MOE_DTYPE routing_weight_val = routing_weights[token_idx * MAX_TOPK + expert_slot];
 #    endif
 
-#    if WEIGHT_COMPRESSEION_DT == 0
+#    if DOWN_WEIGHT_DT == 0
     down_gemv_n2x_u4(weight, scales, zps, routing_weight_val, y, N, K, x2, xg_sum);
-#    elif WEIGHT_COMPRESSEION_DT == 1
+#    elif DOWN_WEIGHT_DT == 1
     down_gemv_n2x_u8(weight, scales, zps, routing_weight_val, y, N, K, x2, xg_sum);
-#    elif WEIGHT_COMPRESSEION_DT == 2
+#    elif DOWN_WEIGHT_DT == 2
     down_gemv_n2x_f16(weight, routing_weight_val, y, N, K, x2);
-#    elif WEIGHT_COMPRESSEION_DT == 3
+#    elif DOWN_WEIGHT_DT == 3
     down_gemv_n2x_u2(weight, scales, zps, routing_weight_val, y, N, K, x2, xg_sum);
 #    endif
 }

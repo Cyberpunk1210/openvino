@@ -54,7 +54,13 @@ ReorderWeightsKernelInt4::DispatchData ReorderWeightsKernelInt4::SetDefault(cons
     } else if (output.GetLayout() == WeightsLayout::os_iyx_osv64) {
         dispatchData.gws = { Align(output.OFM().v, 64) / 2, output.IFM().v, 1 };
     } else if (output.GetLayout() == WeightsLayout::os_is_yx_osv64_isv2) {
-        dispatchData.gws = { Align(output.OFM().v, 64), output.IFM().v / 2, 1 };
+        if (output.GetDType() == WeightsType::UINT2) {
+            // u2: each output byte packs a k-pair of two output features,
+            // so a 64-wide k-pair line holds 32 bytes
+            dispatchData.gws = { Align(output.OFM().v, 64) / 2, output.IFM().v / 2, 1 };
+        } else {
+            dispatchData.gws = { Align(output.OFM().v, 64), output.IFM().v / 2, 1 };
+        }
     } else if (output.GetLayout() == WeightsLayout::oiyx) {
         auto dims = output.GetDims();
         bool has_pads = std::any_of(dims.begin(), dims.end(), [](const kernel_selector::Tensor::Dim& d) {
@@ -140,9 +146,11 @@ bool ReorderWeightsKernelInt4::Validate(const Params& params) const {
                     && output.LogicalSize() == output.OFM().v * output.IFM().v),
                     "Reorder weight i4 only supports 2D input/output, except when adding padding for the same shape(WeightsLayout::oiyx).");
 
-    // u2 packed weights are supported only for repacking to os_iyx_osv16 and for plain/transposed oiyx
+    // u2 packed weights are supported only for repacking to os_iyx_osv16 / os_is_yx_osv64_isv2
+    // and for plain/transposed oiyx
     if (output.GetDType() == WeightsType::UINT2) {
         bool supported_u2_case = input.GetLayout() == WeightsLayout::oiyx && output.GetLayout() == WeightsLayout::os_iyx_osv16;
+        supported_u2_case |= input.GetLayout() == WeightsLayout::oiyx && output.GetLayout() == WeightsLayout::os_is_yx_osv64_isv2;
         supported_u2_case |= input.GetLayout() == WeightsLayout::ioyx && output.GetLayout() == WeightsLayout::oiyx;
         return supported_u2_case;
     }

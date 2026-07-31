@@ -14,6 +14,11 @@
 using namespace cldnn;  // TODO: Remove once namespaces are aligned
 namespace ov::intel_gpu::ocl {
 
+// One subgroup (SG_SIZE lanes) per output channel; CHANNELS_PER_WG channels share a
+// workgroup and one SLM-staged activation row. Must match gather_matmul_u2_ref.cl.
+constexpr size_t SG_SIZE = 16;
+constexpr size_t CHANNELS_PER_WG = 8;
+
 JitConstants GatherMatmulU2RefGenerator::get_jit_constants(const RuntimeParams& params) const {
     auto jit = make_base_jit_constants(params);
     auto cfg = GatherMatmulMicroGenerator::get_config(params);
@@ -27,12 +32,17 @@ JitConstants GatherMatmulU2RefGenerator::get_jit_constants(const RuntimeParams& 
     OPENVINO_ASSERT(weight_layout.data_type == data_types::u2, "GatherMatmulU2RefGenerator requires u2 weights, got ", weight_layout.data_type);
     OPENVINO_ASSERT(cfg.is_weight_quantized, "GatherMatmulU2RefGenerator requires quantized weights");
     OPENVINO_ASSERT(expert_stride % 4 == 0, "GatherMatmulU2RefGenerator: u2 expert element count ", expert_stride, " is not a multiple of 4");
+    // uchar4 weight loads: each lane-load covers 16 u2 values and keeps row/expert bases 4-byte aligned.
+    OPENVINO_ASSERT(k % 16 == 0, "GatherMatmulU2RefGenerator: u2 reduction dim ", k, " is not a multiple of 16");
 
     // u2: 4 values per byte.
     jit.make("EXPERT_STRIDE", expert_stride / 4);
     jit.make("M_GEMM", m);
+    jit.make("K_GEMM", k);
     jit.make("INPUT_STRIDE", k);
     jit.make("OUTPUT_STRIDE", m);
+    jit.make("SG_SIZE", SG_SIZE);
+    jit.make("CHANNELS_PER_WG", CHANNELS_PER_WG);
 
     const auto& scale_shape = params.input_layouts[cfg.weight_scale_idx].get_shape();
     jit.make("WEIGHT_SCALE_DT", to_ocl_type(data_types::f16));
@@ -40,6 +50,14 @@ JitConstants GatherMatmulU2RefGenerator::get_jit_constants(const RuntimeParams& 
         jit.make("NUM_GROUPS", scale_shape[2]);
     else
         jit.make("NUM_GROUPS", 1);
+
+    const size_t num_groups = cfg.weight_group_size > 0 ? static_cast<size_t>(scale_shape[2]) : 1;
+    OPENVINO_ASSERT(k % num_groups == 0, "GatherMatmulU2RefGenerator: K (", k, ") must be divisible by num_scale_groups (", num_groups, ")");
+    const size_t group_size = k / num_groups;
+    // Each packed byte (4 u2 values) must be fully inside one quant group.
+    OPENVINO_ASSERT(group_size % 4 == 0, "GatherMatmulU2RefGenerator: group_size ", group_size, " is not a multiple of 4");
+    // group_size % 16 == 0: a whole uchar4 (16 u2 values) shares one quant group.
+    jit.make("GROUP_VEC_ALIGNED", group_size % 16 == 0 ? 1 : 0);
 
     if (cfg.has_bias) {
         const auto& bias_shape = params.input_layouts[gather_matmul::BGMInputIdx::BIAS].get_shape();
@@ -114,12 +132,11 @@ DispatchDataFunc GatherMatmulU2RefGenerator::get_dispatch_data_func() const {
         const size_t m = weight_shape[1];
         const size_t k = weight_shape.size() == 4 ? weight_shape[2] * weight_shape[3] : weight_shape[2];
 
-        // One work-item per output element: x = output channel, y = flat (token, expert_slot).
-        constexpr size_t WG_M = 64;
-        wgs.local = {WG_M, 1, 1};
-        wgs.global = {ceil_div(m, WG_M) * WG_M,
-                      static_cast<size_t>(rtp->n_tokens) * static_cast<size_t>(rtp->top_k),
-                      1};
+        // Coalesced subgroup GEMV: one subgroup (SG_SIZE lanes) per output channel n;
+        // CHANNELS_PER_WG channels per workgroup share one SLM-staged activation row.
+        wgs.local = {SG_SIZE, CHANNELS_PER_WG, 1};
+        wgs.global = {SG_SIZE, ((m + CHANNELS_PER_WG - 1) / CHANNELS_PER_WG) * CHANNELS_PER_WG,
+                      static_cast<size_t>(rtp->n_tokens) * static_cast<size_t>(rtp->top_k)};
 
         ScalarDescriptor s_m{ScalarDescriptor::Types::INT32};
         s_m.v.s32 = static_cast<int32_t>(m);

@@ -118,12 +118,23 @@ inline uint moe_unpack_u2_byte(uint b) {
 
 // broadcast_zp == 0: src holds src_count uints of u2-packed data; each work item
 //                    unpacks one uint (4 bytes) into 2 uints (8 bytes) of u4 data.
-// broadcast_zp != 0: src holds a single scalar zp element (byte); each work item
+// broadcast_zp == 1: src holds a single scalar zp element (byte); each work item
 //                    replicates it into both nibbles of one output byte, so a
 //                    per-tensor zp is materialized as a full u4 zp tensor and
 //                    src_count is the output byte count.
+// broadcast_zp == 2: src holds src_count single-byte zp VALUES (u8/i8, e.g. a
+//                    per-channel zp); each work item packs two adjacent values
+//                    into one u4 output byte, so dst holds ceil(src_count/2) bytes.
 KERNEL(moe_unpack_u2_to_u4)(const __global uchar* src, __global uchar* dst, int src_count, int broadcast_zp) {
     const size_t i = get_global_id(0);
+    if (broadcast_zp == 2) {
+        if (i >= ((size_t)src_count + 1) / 2)
+            return;
+        const uint v0 = src[2 * i];
+        const uint v1 = (2 * i + 1 < (size_t)src_count) ? src[2 * i + 1] : 0;
+        dst[i] = (uchar)((v0 & 0xFu) | ((v1 & 0xFu) << 4));
+        return;
+    }
     if (i >= (size_t)src_count)
         return;
     if (broadcast_zp != 0) {

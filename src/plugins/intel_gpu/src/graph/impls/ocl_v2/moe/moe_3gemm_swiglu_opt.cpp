@@ -2521,13 +2521,39 @@ public:
                 work_items = zp_dst_bytes;  // one output byte per work item
                 zp_mode = 1;
                 zp_count = static_cast<int>(zp_dst_bytes);
-            } else {
+            } else if (zp_src->get_layout().data_type == data_types::u2) {
+                // u2-packed zp: same byte-wise unpack as the weights.
                 const size_t zp_src_bytes = zp_src->size();
                 OPENVINO_ASSERT(zp_src_bytes % 4 == 0, "moe_3gemm u2 zp buffer byte size ", zp_src_bytes, " is not a multiple of 4");
                 zp_dst_bytes = zp_src_bytes * 2;
                 work_items = zp_src_bytes / 4;  // one input uint per work item
                 zp_mode = 0;
                 zp_count = static_cast<int>(zp_src_bytes / 4);
+            } else {
+                // Byte-wide zp (u8/i8, e.g. per-channel or per-group): one VALUE per
+                // byte, NOT u2-packed data. Pack two adjacent values into one u4
+                // byte (mode 2); a byte-wise u2 unpack would double the values into
+                // garbage and silently corrupt prefill dequant.
+                const size_t zp_vals = zp_src->get_layout().count();
+                const size_t k = (i == 2) ? static_cast<size_t>(_intermediate_size) : static_cast<size_t>(_hidden_size);
+                const size_t oc = (i == 2) ? static_cast<size_t>(_hidden_size) : static_cast<size_t>(_intermediate_size);
+                const size_t gs = (i == 2) ? static_cast<size_t>(_down_group_size) : static_cast<size_t>(_gate_up_group_size);
+                const size_t num_groups = (gs == 0 || gs >= k) ? 1 : (k / gs);
+                const size_t expected = static_cast<size_t>(config.num_expert) * num_groups * oc;
+                OPENVINO_ASSERT(zp_vals == expected,
+                                "moe_3gemm u2 zp element count ",
+                                zp_vals,
+                                " does not match grouped GEMM zp descriptor [",
+                                config.num_expert,
+                                ", ",
+                                num_groups,
+                                ", ",
+                                oc,
+                                "]");
+                zp_dst_bytes = (zp_vals + 1) / 2;
+                work_items = zp_dst_bytes;  // one output byte per work item
+                zp_mode = 2;
+                zp_count = static_cast<int>(zp_vals);
             }
             if (!_u2_unpack_zp[i] || _u2_unpack_zp[i]->size() < zp_dst_bytes) {
                 auto dst_layout =
@@ -2583,13 +2609,33 @@ public:
                 work_items = zp_dst_bytes;  // one output byte per work item
                 zp_mode = 1;
                 zp_count = static_cast<int>(zp_dst_bytes);
-            } else {
+            } else if (zp_src->get_layout().data_type == data_types::u2) {
                 const size_t zp_src_bytes = zp_src->size();
                 OPENVINO_ASSERT(zp_src_bytes % 4 == 0, "moe_3gemm u2 shared zp buffer byte size ", zp_src_bytes, " is not a multiple of 4");
                 zp_dst_bytes = zp_src_bytes * 2;
                 work_items = zp_src_bytes / 4;  // one input uint per work item
                 zp_mode = 0;
                 zp_count = static_cast<int>(zp_src_bytes / 4);
+            } else {
+                // Byte-wide zp (u8/i8): pack two values per u4 byte (mode 2), same as
+                // the routed-expert path; a byte-wise u2 unpack would corrupt it.
+                const size_t zp_vals = zp_src->get_layout().count();
+                const size_t k = (i == 2) ? static_cast<size_t>(_shared_intermediate_size) : static_cast<size_t>(_hidden_size);
+                const size_t oc = (i == 2) ? static_cast<size_t>(_hidden_size) : static_cast<size_t>(_shared_intermediate_size);
+                const size_t gs = (i == 2) ? static_cast<size_t>(_down_group_size) : static_cast<size_t>(_gate_up_group_size);
+                const size_t num_groups = (gs == 0 || gs >= k) ? 1 : (k / gs);
+                OPENVINO_ASSERT(zp_vals == num_groups * oc,
+                                "moe_3gemm u2 shared zp element count ",
+                                zp_vals,
+                                " does not match shared-expert zp descriptor [",
+                                num_groups,
+                                ", ",
+                                oc,
+                                "]");
+                zp_dst_bytes = (zp_vals + 1) / 2;
+                work_items = zp_dst_bytes;
+                zp_mode = 2;
+                zp_count = static_cast<int>(zp_vals);
             }
             if (!_u2_unpack_shared_zp[i] || _u2_unpack_shared_zp[i]->size() < zp_dst_bytes) {
                 auto dst_layout =
@@ -2947,7 +2993,15 @@ public:
         // run on every prefill path, so the unpack is not tied to _weights_u2 alone.
         cldnn::event::ptr unpack_event = nullptr;
         if (_weights_u2 || has_u2_shared_weights()) {
-            unpack_event = unpack_u2_weights_for_prefill(instance, scratch, events);
+            try {
+                unpack_event = unpack_u2_weights_for_prefill(instance, scratch, events);
+            } catch (const std::exception& e) {
+                // The batched GEMV fuses the shared expert in-kernel, so returning it
+                // directly also skips the oneDNN shared-expert block below.
+                GPU_DEBUG_TRACE_DETAIL << "u2 weight unpack for prefill failed (" << e.what() << "), falling back to batched GEMV" << std::endl;
+                instance.output_memory_ptr(0)->fill(stream, false);
+                return exec_batched_gemv(events, instance, scratch, token_num);
+            }
         }
         if (_weights_u2) {
             // Run the grouped GEMM path on the unpacked u4 weights as regular u4 weights. If

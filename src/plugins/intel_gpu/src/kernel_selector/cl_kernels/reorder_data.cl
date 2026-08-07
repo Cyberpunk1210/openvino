@@ -302,7 +302,9 @@ KERNEL (reorder_data)(
         atomic_and(&output_u32[main_idx], ~(0x0F << shift));
         atomic_or(&output_u32[main_idx], (val_u32 << shift));
     #elif defined(UINT2_OUTPUT)
-        OUTPUT_TYPE val_char = __TO_OUTPUT_REORDER_TYPE(res);
+        // res_tmp, not res: `res` is only declared in the HAS_FUSED_OPS branch above, and these are
+        // mutually exclusive #elif arms. (The INT4/UINT4 arm right above uses res_tmp for that reason.)
+        OUTPUT_TYPE val_char = __TO_OUTPUT_REORDER_TYPE(res_tmp);
         int val_i32 = convert_int(val_char);
 
         #if !CONVERT_TRUNCATE

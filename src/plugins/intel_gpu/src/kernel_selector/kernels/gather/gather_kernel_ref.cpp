@@ -292,7 +292,9 @@ JitConstants GatherKernelRef::GetJitConstants(const gather_params& params) const
         } else if (wt == Datatype::INT4) {
             jit.Merge(make_sub_byte_packed_type_jit_constant("INT4_PACKED_TYPE", WeightsType::INT4, 2));
         } else if (wt == Datatype::UINT2) {
-            jit.Merge(make_sub_byte_packed_type_jit_constant("INT4_PACKED_TYPE", WeightsType::UINT2, 4));
+            // Distinct macro name from INT4_PACKED_TYPE: the u2 unpack helpers live in int2_utils.cl,
+            // and the packed type is uint2x4_t (4 values/byte) rather than a 2-values/byte int4x2_t.
+            jit.Merge(make_sub_byte_packed_type_jit_constant("UINT2_PACKED_TYPE", WeightsType::UINT2, 4));
         }
 
         const size_t scale_groups_num = params.decompression_scale.LogicalSize();
